@@ -19,11 +19,13 @@ const BASE_URL = process.env.BASE_URL || '';
 const MONGODB_URI = process.env.MONGODB_URI || '';
 const MONGODB_DB = process.env.MONGODB_DB || 'linklite';
 const MONGODB_COLLECTION = process.env.MONGODB_COLLECTION || 'links';
+const FALLBACK_FILE_PATH = process.env.FALLBACK_FILE_PATH || path.join(__dirname, 'data', 'links.local.json');
 
 const store = new LinkStore({
   mongoUri: MONGODB_URI,
   dbName: MONGODB_DB,
-  collectionName: MONGODB_COLLECTION
+  collectionName: MONGODB_COLLECTION,
+  fallbackFilePath: FALLBACK_FILE_PATH
 });
 
 function parseBody(req) {
@@ -319,7 +321,8 @@ const server = http.createServer((req, res) => {
 
 if (process.env.NODE_ENV !== 'test') {
   server.listen(PORT, HOST, () => {
-    console.log(`LinkLite JS running on http://${HOST}:${PORT}`);
+    const mode = MONGODB_URI ? 'MongoDB mode' : `Local fallback mode (${FALLBACK_FILE_PATH})`;
+    console.log(`LinkLite JS running on http://${HOST}:${PORT} - ${mode}`);
   });
 }
 

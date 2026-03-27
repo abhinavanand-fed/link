@@ -9,12 +9,42 @@ A full-featured JavaScript link shortener website with:
 - Visit logs (IP, referer, user-agent)
 - Browser UI and JSON API
 - MongoDB Atlas persistence (works well on Render)
+- Automatic local-file fallback if `MONGODB_URI` is not set
 
 ## Quick start (local)
+
+### Option A: Local fallback mode (no MongoDB required)
+
+```bash
+npm install
+npm start
+```
+
+This runs immediately and stores links in `data/links.local.json`.
+
+### Option B: MongoDB mode
+
+**macOS/Linux (bash/zsh):**
 
 ```bash
 npm install
 export MONGODB_URI='your_mongodb_connection_string'
+npm start
+```
+
+**Windows CMD:**
+
+```cmd
+npm install
+set MONGODB_URI=your_mongodb_connection_string
+npm start
+```
+
+**Windows PowerShell:**
+
+```powershell
+npm install
+$env:MONGODB_URI="your_mongodb_connection_string"
 npm start
 ```
 
@@ -74,6 +104,7 @@ npm test
 - `PORT` (default: `5000`)
 - `HOST` (default: `0.0.0.0`)
 - `BASE_URL` (optional absolute base used to build short URLs)
-- `MONGODB_URI` (**required**)
+- `MONGODB_URI` (optional; if missing, app uses local fallback)
 - `MONGODB_DB` (default: `linklite`)
 - `MONGODB_COLLECTION` (default: `links`)
+- `FALLBACK_FILE_PATH` (default: `./data/links.local.json`)
