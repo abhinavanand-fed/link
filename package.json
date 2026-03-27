@@ -1,0 +1,12 @@
+{
+  "name": "linklite-js",
+  "version": "1.0.0",
+  "description": "Full-featured link shortener website in Node.js",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  }
+}
