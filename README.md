@@ -6,10 +6,12 @@ A full-featured JavaScript link shortener website with:
 - Optional custom aliases
 - Optional expiration timestamps
 - Redirect + click tracking
-- Visit logs (IP, referer, user-agent)
+- Visit logs (referer, user-agent) with click counts (no IP storage)
 - Browser UI and JSON API
 - MongoDB Atlas persistence (works well on Render)
 - Automatic local-file fallback if `MONGODB_URI` is not set
+- Basic write rate limiting + optional API key auth
+- Owner-scoped link visibility (only your own links/stats are listed)
 
 ## Quick start (local)
 
@@ -62,11 +64,12 @@ Server runs on `http://localhost:5000` by default.
    - `MONGODB_DB` = `linklite` (or your preferred DB name)
    - `MONGODB_COLLECTION` = `links` (or your preferred collection)
    - `BASE_URL` = your Render public URL (optional but recommended)
+   - `API_KEY` = protect `POST /api/shorten` (optional but recommended)
 5. Deploy.
 
 ## Important security note
 
-Because a MongoDB credential was shared in chat, rotate/reset that MongoDB password in Atlas before production use and set the new URI via Render environment variables.
+Because a MongoDB credential was shared in chat, rotate/reset that MongoDB password in Atlas before production use and set the new URI via environment variables.
 
 ## NPM scripts
 
@@ -82,18 +85,30 @@ npm test
 
 `POST /api/shorten`
 
+Headers (optional unless `API_KEY` is configured):
+
+```http
+x-api-key: <your_api_key>
+```
+
+Body:
+
 ```json
 {
   "url": "https://example.com/docs",
   "customCode": "docs",
   "title": "Documentation",
-  "expiresAt": "2026-12-31T23:59"
+  "expiresAt": "2026-12-31T23:59:00Z"
 }
 ```
 
+> `expiresAt` must be ISO 8601 with timezone (`Z` or offset).
+
 ### Get link stats
 
-`GET /api/stats/<code>`
+`GET /api/stats/<code>?limit=25&offset=0`
+
+This endpoint only returns stats when the requester owner ID matches the link owner. For API clients, pass `x-owner-id` consistently when creating and reading links.
 
 ### Redirect
 
@@ -108,3 +123,9 @@ npm test
 - `MONGODB_DB` (default: `linklite`)
 - `MONGODB_COLLECTION` (default: `links`)
 - `FALLBACK_FILE_PATH` (default: `./data/links.local.json`)
+- `API_KEY` (optional key required for `POST /api/shorten`)
+- `x-owner-id` request header (API clients: set this on create/stats to scope links to your identity)
+- Browser UI uses a secure cookie (`ll_owner`) to scope "Your recent links" and stats pages
+- `WRITE_RATE_LIMIT_WINDOW_MS` (default: `60000`)
+- `WRITE_RATE_LIMIT_MAX` (default: `30`)
+- `CLEANUP_INTERVAL_MS` (default: `900000`)

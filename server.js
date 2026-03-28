@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6,8 +7,8 @@ import { LinkStore } from './lib/store.js';
 import {
   escapeHtml,
   isExpired,
+  isSafePublicHttpUrl,
   isValidCustomCode,
-  isValidHttpUrl,
   toIsoOrNull
 } from './lib/utils.js';
 
@@ -20,6 +21,11 @@ const MONGODB_URI = process.env.MONGODB_URI || '';
 const MONGODB_DB = process.env.MONGODB_DB || 'linklite';
 const MONGODB_COLLECTION = process.env.MONGODB_COLLECTION || 'links';
 const FALLBACK_FILE_PATH = process.env.FALLBACK_FILE_PATH || path.join(__dirname, 'data', 'links.local.json');
+const CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS || 15 * 60 * 1000);
+const WRITE_RATE_LIMIT_WINDOW_MS = Number(process.env.WRITE_RATE_LIMIT_WINDOW_MS || 60 * 1000);
+const WRITE_RATE_LIMIT_MAX = Number(process.env.WRITE_RATE_LIMIT_MAX || 30);
+const API_KEY = process.env.API_KEY || '';
+const OWNER_COOKIE_NAME = 'll_owner';
 
 const store = new LinkStore({
   mongoUri: MONGODB_URI,
@@ -27,6 +33,10 @@ const store = new LinkStore({
   collectionName: MONGODB_COLLECTION,
   fallbackFilePath: FALLBACK_FILE_PATH
 });
+
+const CSS_PATH = path.join(__dirname, 'public', 'styles.css');
+const CSS_CONTENT = fs.readFileSync(CSS_PATH, 'utf-8');
+const writeRateLimiter = new Map();
 
 function parseBody(req) {
   return new Promise((resolve) => {
@@ -53,9 +63,56 @@ function parseBody(req) {
   });
 }
 
-function send(res, status, body, contentType = 'text/html; charset=utf-8') {
-  res.writeHead(status, { 'content-type': contentType });
+function parseCookies(req) {
+  const raw = req.headers.cookie || '';
+  const pairs = raw.split(';').map((part) => part.trim()).filter(Boolean);
+  const entries = pairs.map((part) => {
+    const idx = part.indexOf('=');
+    if (idx === -1) return [part, ''];
+    return [part.slice(0, idx), decodeURIComponent(part.slice(idx + 1))];
+  });
+  return Object.fromEntries(entries);
+}
+
+function resolveOwner(req) {
+  const headerOwner = req.headers['x-owner-id'];
+  if (typeof headerOwner === 'string' && headerOwner.trim()) {
+    return { ownerId: headerOwner.trim(), setCookieHeader: null };
+  }
+
+  const cookies = parseCookies(req);
+  if (cookies[OWNER_COOKIE_NAME]) {
+    return { ownerId: cookies[OWNER_COOKIE_NAME], setCookieHeader: null };
+  }
+
+  const ownerId = randomUUID();
+  const setCookieHeader = `${OWNER_COOKIE_NAME}=${encodeURIComponent(ownerId)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000`;
+  return { ownerId, setCookieHeader };
+}
+
+function getSecurityHeaders(contentType, extraHeaders = {}) {
+  return {
+    'content-type': contentType,
+    'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY',
+    'referrer-policy': 'no-referrer',
+    'permissions-policy': 'geolocation=(), microphone=(), camera=()',
+    'content-security-policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'",
+    ...extraHeaders
+  };
+}
+
+function send(res, status, body, contentType = 'text/html; charset=utf-8', extraHeaders = {}) {
+  res.writeHead(status, getSecurityHeaders(contentType, extraHeaders));
   res.end(body);
+}
+
+function sendJson(res, status, payload, extraHeaders = {}) {
+  return send(res, status, JSON.stringify(payload), 'application/json; charset=utf-8', extraHeaders);
+}
+
+function jsonError(res, status, code, message, extraHeaders = {}) {
+  return sendJson(res, status, { error: { code, message } }, extraHeaders);
 }
 
 function buildShortUrl(req, code) {
@@ -65,14 +122,13 @@ function buildShortUrl(req, code) {
 }
 
 function pageLayout(title, content) {
-  const css = fs.readFileSync(path.join(__dirname, 'public', 'styles.css'), 'utf-8');
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>${escapeHtml(title)}</title>
-<style>${css}</style>
+<style>${CSS_CONTENT}</style>
 </head>
 <body>
   <header class="site-header">
@@ -84,8 +140,8 @@ function pageLayout(title, content) {
 </html>`;
 }
 
-async function homePage(message = '') {
-  const recentLinks = await store.getRecent(15);
+async function homePage(ownerId, message = '') {
+  const recentLinks = await store.getRecent(15, ownerId);
   const recent = recentLinks
     .map(
       (item) => `<tr>
@@ -108,12 +164,13 @@ async function homePage(message = '') {
   <label>Destination URL<input type="url" name="originalUrl" required placeholder="https://example.com/very/long/link"/></label>
   <label>Custom alias (optional)<input type="text" name="customCode" placeholder="promo-2026"/></label>
   <label>Title (optional)<input type="text" name="title" placeholder="Campaign name"/></label>
-  <label>Expiration (optional, ISO datetime)<input type="text" name="expiresAt" placeholder="2026-12-31T23:59"/></label>
+  <label>Expiration (optional, ISO datetime with timezone)<input type="text" name="expiresAt" placeholder="2026-12-31T23:59:00Z"/></label>
   <button type="submit">Shorten link</button>
 </form>
 </section>
 <section class="card">
-<h2>Recent links</h2>
+<h2>Your recent links</h2>
+<p>Only links created with your owner ID are shown here.</p>
 <div class="table-wrap">
 <table>
 <thead><tr><th>Code</th><th>Destination</th><th>Clicks</th><th>Stats</th></tr></thead>
@@ -146,7 +203,6 @@ function statsPage(record) {
     .map(
       (visit) => `<tr>
 <td>${escapeHtml(visit.visitedAt)}</td>
-<td>${escapeHtml(visit.ipAddress || 'Unknown')}</td>
 <td>${escapeHtml(visit.referer || 'Direct')}</td>
 <td>${escapeHtml(visit.userAgent || 'Unknown')}</td>
 </tr>`
@@ -166,8 +222,8 @@ function statsPage(record) {
 <h2>Recent visits</h2>
 <div class="table-wrap">
 <table>
-<thead><tr><th>When (UTC)</th><th>IP</th><th>Referer</th><th>User agent</th></tr></thead>
-<tbody>${visitRows || '<tr><td colspan="4">No visit data yet.</td></tr>'}</tbody>
+<thead><tr><th>When (UTC)</th><th>Referer</th><th>User agent</th></tr></thead>
+<tbody>${visitRows || '<tr><td colspan="3">No visit data yet.</td></tr>'}</tbody>
 </table>
 </div>
 </section>`
@@ -178,18 +234,77 @@ function notFoundPage() {
   return pageLayout('Not found', '<section class="card"><h1>404</h1><p>The link does not exist.</p></section>');
 }
 
+function getClientIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.trim()) {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.socket.remoteAddress || 'unknown';
+}
+
+function enforceWriteRateLimit(req) {
+  const now = Date.now();
+  const ip = getClientIp(req);
+  const key = `${ip}|${req.url}`;
+  const state = writeRateLimiter.get(key) || { count: 0, resetAt: now + WRITE_RATE_LIMIT_WINDOW_MS };
+
+  if (now > state.resetAt) {
+    state.count = 0;
+    state.resetAt = now + WRITE_RATE_LIMIT_WINDOW_MS;
+  }
+
+  state.count += 1;
+  writeRateLimiter.set(key, state);
+
+  if (state.count > WRITE_RATE_LIMIT_MAX) {
+    return {
+      blocked: true,
+      retryAfterSeconds: Math.max(1, Math.ceil((state.resetAt - now) / 1000))
+    };
+  }
+
+  return { blocked: false };
+}
+
+function requireApiKey(req) {
+  if (!API_KEY) return true;
+  const provided = req.headers['x-api-key'];
+  return typeof provided === 'string' && provided === API_KEY;
+}
+
+function sanitizeVisitRecord(record) {
+  return {
+    visitedAt: record.visitedAt,
+    referer: record.referer,
+    userAgent: record.userAgent
+  };
+}
+
 async function route(req, res) {
   const reqUrl = new URL(req.url, `http://${req.headers.host || `localhost:${PORT}`}`);
   const pathName = reqUrl.pathname;
+  const owner = resolveOwner(req);
+  const baseHeaders = owner.setCookieHeader ? { 'set-cookie': owner.setCookieHeader } : {};
+
+  const sendWithOwner = (status, body, contentType) => send(res, status, body, contentType, baseHeaders);
+  const sendJsonWithOwner = (status, payload) => sendJson(res, status, payload, baseHeaders);
+  const jsonErrorWithOwner = (status, code, message) => jsonError(res, status, code, message, baseHeaders);
 
   if (req.method === 'GET' && pathName === '/public/styles.css') {
-    const cssPath = path.join(__dirname, 'public', 'styles.css');
-    const css = fs.readFileSync(cssPath, 'utf-8');
-    return send(res, 200, css, 'text/css; charset=utf-8');
+    return sendWithOwner(200, CSS_CONTENT, 'text/css; charset=utf-8');
   }
 
   if (req.method === 'GET' && pathName === '/') {
-    return send(res, 200, await homePage());
+    return sendWithOwner(200, await homePage(owner.ownerId), 'text/html; charset=utf-8');
+  }
+
+  if (req.method === 'POST' && (pathName === '/shorten' || pathName === '/api/shorten')) {
+    const rate = enforceWriteRateLimit(req);
+    if (rate.blocked) {
+      baseHeaders['retry-after'] = String(rate.retryAfterSeconds);
+      if (pathName === '/api/shorten') return jsonErrorWithOwner(429, 'rate_limited', 'Too many create requests. Please retry later.');
+      return sendWithOwner(429, await homePage(owner.ownerId, 'Too many requests. Please wait and try again.'), 'text/html; charset=utf-8');
+    }
   }
 
   if (req.method === 'POST' && pathName === '/shorten') {
@@ -199,134 +314,166 @@ async function route(req, res) {
     const title = String(body.title || '').trim();
     const expiresAtInput = String(body.expiresAt || '').trim();
 
-    if (!isValidHttpUrl(originalUrl)) {
-      return send(res, 400, await homePage('Please provide a valid URL that starts with http:// or https://'));
+    if (!isSafePublicHttpUrl(originalUrl)) {
+      return sendWithOwner(400, await homePage(owner.ownerId, 'Please provide a valid public URL that starts with http:// or https://'), 'text/html; charset=utf-8');
     }
 
     if (customCode && !isValidCustomCode(customCode)) {
-      return send(res, 400, await homePage('Custom code must be 3-32 chars: letters, numbers, - or _.'));
-    }
-
-    if (customCode && await store.codeExists(customCode)) {
-      return send(res, 409, await homePage('That custom alias is already taken.'));
+      return sendWithOwner(400, await homePage(owner.ownerId, 'Custom code must be 3-32 chars: letters, numbers, - or _.'), 'text/html; charset=utf-8');
     }
 
     const expiresAt = toIsoOrNull(expiresAtInput);
     if (expiresAtInput && !expiresAt) {
-      return send(res, 400, await homePage('Expiration should be a valid date/time. Example: 2026-12-31T23:59'));
+      return sendWithOwner(400, await homePage(owner.ownerId, 'Expiration must be ISO 8601 with timezone. Example: 2026-12-31T23:59:00Z'), 'text/html; charset=utf-8');
     }
 
     const record = await store.create({
+      ownerId: owner.ownerId,
       originalUrl,
       customCode: customCode || null,
       title,
       expiresAt
     });
 
-    return send(res, 201, createdPage(buildShortUrl(req, record.shortCode), record));
+    return sendWithOwner(201, createdPage(buildShortUrl(req, record.shortCode), record), 'text/html; charset=utf-8');
   }
 
   if (req.method === 'POST' && pathName === '/api/shorten') {
+    if (!requireApiKey(req)) {
+      return jsonErrorWithOwner(401, 'unauthorized', 'Missing or invalid API key.');
+    }
+
     const body = await parseBody(req);
     const originalUrl = String(body.url || '').trim();
     const customCode = String(body.customCode || '').trim();
     const title = String(body.title || '').trim();
     const expiresAtInput = String(body.expiresAt || '').trim();
 
-    if (!isValidHttpUrl(originalUrl)) {
-      return send(res, 400, JSON.stringify({ error: 'Invalid URL.' }), 'application/json');
+    if (!isSafePublicHttpUrl(originalUrl)) {
+      return jsonErrorWithOwner(400, 'invalid_url', 'Invalid URL. Must be public http(s).');
     }
 
     if (customCode && !isValidCustomCode(customCode)) {
-      return send(res, 400, JSON.stringify({ error: 'Invalid custom code.' }), 'application/json');
-    }
-
-    if (customCode && await store.codeExists(customCode)) {
-      return send(res, 409, JSON.stringify({ error: 'Custom code already exists.' }), 'application/json');
+      return jsonErrorWithOwner(400, 'invalid_custom_code', 'Invalid custom code.');
     }
 
     const expiresAt = toIsoOrNull(expiresAtInput);
     if (expiresAtInput && !expiresAt) {
-      return send(res, 400, JSON.stringify({ error: 'Invalid expiration datetime.' }), 'application/json');
+      return jsonErrorWithOwner(400, 'invalid_expiration', 'Invalid expiration datetime. Use ISO 8601 with timezone.');
     }
 
-    const record = await store.create({ originalUrl, customCode: customCode || null, title, expiresAt });
-    return send(
-      res,
-      201,
-      JSON.stringify({
-        shortCode: record.shortCode,
-        shortUrl: buildShortUrl(req, record.shortCode),
-        originalUrl: record.originalUrl
-      }),
-      'application/json'
-    );
+    const record = await store.create({ ownerId: owner.ownerId, originalUrl, customCode: customCode || null, title, expiresAt });
+    return sendJsonWithOwner(201, {
+      ownerId: record.ownerId,
+      shortCode: record.shortCode,
+      shortUrl: buildShortUrl(req, record.shortCode),
+      originalUrl: record.originalUrl,
+      title: record.title,
+      expiresAt: record.expiresAt,
+      createdAt: record.createdAt
+    });
   }
 
   if (req.method === 'GET' && pathName.startsWith('/api/stats/')) {
     const code = decodeURIComponent(pathName.replace('/api/stats/', ''));
     const record = await store.getByCode(code);
-    if (!record) return send(res, 404, JSON.stringify({ error: 'Not found' }), 'application/json');
+    if (!record || record.ownerId !== owner.ownerId) return jsonErrorWithOwner(404, 'not_found', 'Not found');
 
-    return send(
-      res,
-      200,
-      JSON.stringify({
-        shortCode: record.shortCode,
-        originalUrl: record.originalUrl,
-        title: record.title,
-        clickCount: record.clickCount,
-        createdAt: record.createdAt,
-        expiresAt: record.expiresAt,
-        recentVisits: record.visits.slice(0, 25)
-      }),
-      'application/json'
-    );
+    const limit = Math.max(1, Math.min(100, Number(reqUrl.searchParams.get('limit') || 25)));
+    const offset = Math.max(0, Number(reqUrl.searchParams.get('offset') || 0));
+    const totalVisits = record.visits.length;
+
+    return sendJsonWithOwner(200, {
+      shortCode: record.shortCode,
+      originalUrl: record.originalUrl,
+      title: record.title,
+      clickCount: record.clickCount,
+      createdAt: record.createdAt,
+      expiresAt: record.expiresAt,
+      visits: record.visits.slice(offset, offset + limit).map(sanitizeVisitRecord),
+      pagination: {
+        limit,
+        offset,
+        total: totalVisits
+      }
+    });
   }
 
   if (req.method === 'GET' && pathName.startsWith('/stats/')) {
     const code = decodeURIComponent(pathName.replace('/stats/', ''));
     const record = await store.getByCode(code);
-    if (!record) return send(res, 404, notFoundPage());
-    return send(res, 200, statsPage(record));
+    if (!record || record.ownerId !== owner.ownerId) return sendWithOwner(404, notFoundPage(), 'text/html; charset=utf-8');
+    return sendWithOwner(200, statsPage(record), 'text/html; charset=utf-8');
   }
 
   if (req.method === 'GET' && pathName.length > 1) {
     const code = decodeURIComponent(pathName.slice(1));
     const record = await store.getByCode(code);
-    if (!record) return send(res, 404, notFoundPage());
+    if (!record) return sendWithOwner(404, notFoundPage(), 'text/html; charset=utf-8');
     if (isExpired(record.expiresAt)) {
-      return send(res, 410, await homePage('This short link has expired.'));
+      return sendWithOwner(410, await homePage(owner.ownerId, 'This short link has expired.'), 'text/html; charset=utf-8');
     }
 
-    const ipAddress = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
     const userAgent = req.headers['user-agent'] || '';
     const referer = req.headers.referer || '';
 
-    await store.addVisit(code, { ipAddress, userAgent, referer });
-    res.writeHead(302, { location: record.originalUrl });
+    await store.addVisit(code, { userAgent, referer });
+    res.writeHead(302, { location: record.originalUrl, ...getSecurityHeaders('text/plain; charset=utf-8', baseHeaders) });
     res.end();
     return;
   }
 
-  return send(res, 404, notFoundPage());
+  return sendWithOwner(404, notFoundPage(), 'text/html; charset=utf-8');
 }
 
 const server = http.createServer((req, res) => {
+  const started = Date.now();
+
+  const finish = () => {
+    const durationMs = Date.now() - started;
+    const ip = getClientIp(req);
+    console.log(JSON.stringify({
+      at: new Date().toISOString(),
+      method: req.method,
+      path: req.url,
+      statusCode: res.statusCode,
+      durationMs,
+      ip
+    }));
+  };
+
+  res.on('finish', finish);
+
   route(req, res).catch((error) => {
     console.error(error);
     send(res, 500, pageLayout('Server error', '<section class="card"><h1>500</h1><p>Unexpected error.</p></section>'));
   });
 });
 
+let cleanupTimer = null;
+
 if (process.env.NODE_ENV !== 'test') {
   server.listen(PORT, HOST, () => {
     const mode = MONGODB_URI ? 'MongoDB mode' : `Local fallback mode (${FALLBACK_FILE_PATH})`;
     console.log(`LinkLite JS running on http://${HOST}:${PORT} - ${mode}`);
   });
+
+  cleanupTimer = setInterval(async () => {
+    try {
+      const removed = await store.cleanupExpired();
+      if (removed > 0) {
+        console.log(`Expired links cleanup removed ${removed} links.`);
+      }
+    } catch (error) {
+      console.error('Cleanup job failed:', error);
+    }
+  }, CLEANUP_INTERVAL_MS);
+
+  cleanupTimer.unref();
 }
 
 async function shutdown() {
+  if (cleanupTimer) clearInterval(cleanupTimer);
   await store.close();
   process.exit(0);
 }
