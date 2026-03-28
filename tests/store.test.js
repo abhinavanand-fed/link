@@ -102,3 +102,41 @@ test('create throws for duplicate custom code', async () => {
     /already exists/
   );
 });
+
+test('cleanupExpired removes old links and keeps active links', async () => {
+  const store = makeStore();
+
+  await store.create({
+    originalUrl: 'https://example.com/live',
+    customCode: 'live1',
+    expiresAt: new Date(Date.now() + 60_000).toISOString()
+  });
+  await store.create({
+    originalUrl: 'https://example.com/old',
+    customCode: 'old11',
+    expiresAt: new Date(Date.now() - 60_000).toISOString()
+  });
+
+  const removed = await store.cleanupExpired();
+  assert.equal(removed, 1);
+  assert.ok(await store.getByCode('live1'));
+  assert.equal(await store.getByCode('old11'), null);
+});
+
+test('create throws for duplicate custom code', async () => {
+  const store = makeStore();
+
+  await store.create({
+    originalUrl: 'https://example.com/one',
+    customCode: 'dupe01'
+  });
+
+  await assert.rejects(
+    () =>
+      store.create({
+        originalUrl: 'https://example.com/two',
+        customCode: 'dupe01'
+      }),
+    /already exists/
+  );
+});
