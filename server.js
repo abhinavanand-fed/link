@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +25,7 @@ const CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS || 15 * 60 * 
 const WRITE_RATE_LIMIT_WINDOW_MS = Number(process.env.WRITE_RATE_LIMIT_WINDOW_MS || 60 * 1000);
 const WRITE_RATE_LIMIT_MAX = Number(process.env.WRITE_RATE_LIMIT_MAX || 30);
 const API_KEY = process.env.API_KEY || '';
+const OWNER_COOKIE_NAME = 'll_owner';
 
 const store = new LinkStore({
   mongoUri: MONGODB_URI,
@@ -61,28 +63,56 @@ function parseBody(req) {
   });
 }
 
-function getSecurityHeaders(contentType) {
+function parseCookies(req) {
+  const raw = req.headers.cookie || '';
+  const pairs = raw.split(';').map((part) => part.trim()).filter(Boolean);
+  const entries = pairs.map((part) => {
+    const idx = part.indexOf('=');
+    if (idx === -1) return [part, ''];
+    return [part.slice(0, idx), decodeURIComponent(part.slice(idx + 1))];
+  });
+  return Object.fromEntries(entries);
+}
+
+function resolveOwner(req) {
+  const headerOwner = req.headers['x-owner-id'];
+  if (typeof headerOwner === 'string' && headerOwner.trim()) {
+    return { ownerId: headerOwner.trim(), setCookieHeader: null };
+  }
+
+  const cookies = parseCookies(req);
+  if (cookies[OWNER_COOKIE_NAME]) {
+    return { ownerId: cookies[OWNER_COOKIE_NAME], setCookieHeader: null };
+  }
+
+  const ownerId = randomUUID();
+  const setCookieHeader = `${OWNER_COOKIE_NAME}=${encodeURIComponent(ownerId)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000`;
+  return { ownerId, setCookieHeader };
+}
+
+function getSecurityHeaders(contentType, extraHeaders = {}) {
   return {
     'content-type': contentType,
     'x-content-type-options': 'nosniff',
     'x-frame-options': 'DENY',
     'referrer-policy': 'no-referrer',
     'permissions-policy': 'geolocation=(), microphone=(), camera=()',
-    'content-security-policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'"
+    'content-security-policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'",
+    ...extraHeaders
   };
 }
 
-function send(res, status, body, contentType = 'text/html; charset=utf-8') {
-  res.writeHead(status, getSecurityHeaders(contentType));
+function send(res, status, body, contentType = 'text/html; charset=utf-8', extraHeaders = {}) {
+  res.writeHead(status, getSecurityHeaders(contentType, extraHeaders));
   res.end(body);
 }
 
-function sendJson(res, status, payload) {
-  return send(res, status, JSON.stringify(payload), 'application/json; charset=utf-8');
+function sendJson(res, status, payload, extraHeaders = {}) {
+  return send(res, status, JSON.stringify(payload), 'application/json; charset=utf-8', extraHeaders);
 }
 
-function jsonError(res, status, code, message) {
-  return sendJson(res, status, { error: { code, message } });
+function jsonError(res, status, code, message, extraHeaders = {}) {
+  return sendJson(res, status, { error: { code, message } }, extraHeaders);
 }
 
 function buildShortUrl(req, code) {
@@ -110,8 +140,8 @@ function pageLayout(title, content) {
 </html>`;
 }
 
-async function homePage(message = '') {
-  const recentLinks = await store.getRecent(15);
+async function homePage(ownerId, message = '') {
+  const recentLinks = await store.getRecent(15, ownerId);
   const recent = recentLinks
     .map(
       (item) => `<tr>
@@ -139,7 +169,8 @@ async function homePage(message = '') {
 </form>
 </section>
 <section class="card">
-<h2>Recent links</h2>
+<h2>Your recent links</h2>
+<p>Only links created with your owner ID are shown here.</p>
 <div class="table-wrap">
 <table>
 <thead><tr><th>Code</th><th>Destination</th><th>Clicks</th><th>Stats</th></tr></thead>
@@ -172,7 +203,6 @@ function statsPage(record) {
     .map(
       (visit) => `<tr>
 <td>${escapeHtml(visit.visitedAt)}</td>
-<td>${escapeHtml(visit.ipAddress || 'Unknown')}</td>
 <td>${escapeHtml(visit.referer || 'Direct')}</td>
 <td>${escapeHtml(visit.userAgent || 'Unknown')}</td>
 </tr>`
@@ -192,8 +222,8 @@ function statsPage(record) {
 <h2>Recent visits</h2>
 <div class="table-wrap">
 <table>
-<thead><tr><th>When (UTC)</th><th>IP</th><th>Referer</th><th>User agent</th></tr></thead>
-<tbody>${visitRows || '<tr><td colspan="4">No visit data yet.</td></tr>'}</tbody>
+<thead><tr><th>When (UTC)</th><th>Referer</th><th>User agent</th></tr></thead>
+<tbody>${visitRows || '<tr><td colspan="3">No visit data yet.</td></tr>'}</tbody>
 </table>
 </div>
 </section>`
@@ -245,7 +275,6 @@ function requireApiKey(req) {
 function sanitizeVisitRecord(record) {
   return {
     visitedAt: record.visitedAt,
-    ipAddress: record.ipAddress,
     referer: record.referer,
     userAgent: record.userAgent
   };
@@ -254,13 +283,28 @@ function sanitizeVisitRecord(record) {
 async function route(req, res) {
   const reqUrl = new URL(req.url, `http://${req.headers.host || `localhost:${PORT}`}`);
   const pathName = reqUrl.pathname;
+  const owner = resolveOwner(req);
+  const baseHeaders = owner.setCookieHeader ? { 'set-cookie': owner.setCookieHeader } : {};
+
+  const sendWithOwner = (status, body, contentType) => send(res, status, body, contentType, baseHeaders);
+  const sendJsonWithOwner = (status, payload) => sendJson(res, status, payload, baseHeaders);
+  const jsonErrorWithOwner = (status, code, message) => jsonError(res, status, code, message, baseHeaders);
 
   if (req.method === 'GET' && pathName === '/public/styles.css') {
-    return send(res, 200, CSS_CONTENT, 'text/css; charset=utf-8');
+    return sendWithOwner(200, CSS_CONTENT, 'text/css; charset=utf-8');
   }
 
   if (req.method === 'GET' && pathName === '/') {
-    return send(res, 200, await homePage());
+    return sendWithOwner(200, await homePage(owner.ownerId), 'text/html; charset=utf-8');
+  }
+
+  if (req.method === 'POST' && (pathName === '/shorten' || pathName === '/api/shorten')) {
+    const rate = enforceWriteRateLimit(req);
+    if (rate.blocked) {
+      baseHeaders['retry-after'] = String(rate.retryAfterSeconds);
+      if (pathName === '/api/shorten') return jsonErrorWithOwner(429, 'rate_limited', 'Too many create requests. Please retry later.');
+      return sendWithOwner(429, await homePage(owner.ownerId, 'Too many requests. Please wait and try again.'), 'text/html; charset=utf-8');
+    }
   }
 
   if (req.method === 'POST' && (pathName === '/shorten' || pathName === '/api/shorten')) {
@@ -280,31 +324,32 @@ async function route(req, res) {
     const expiresAtInput = String(body.expiresAt || '').trim();
 
     if (!isSafePublicHttpUrl(originalUrl)) {
-      return send(res, 400, await homePage('Please provide a valid public URL that starts with http:// or https://'));
+      return sendWithOwner(400, await homePage(owner.ownerId, 'Please provide a valid public URL that starts with http:// or https://'), 'text/html; charset=utf-8');
     }
 
     if (customCode && !isValidCustomCode(customCode)) {
-      return send(res, 400, await homePage('Custom code must be 3-32 chars: letters, numbers, - or _.'));
+      return sendWithOwner(400, await homePage(owner.ownerId, 'Custom code must be 3-32 chars: letters, numbers, - or _.'), 'text/html; charset=utf-8');
     }
 
     const expiresAt = toIsoOrNull(expiresAtInput);
     if (expiresAtInput && !expiresAt) {
-      return send(res, 400, await homePage('Expiration must be ISO 8601 with timezone. Example: 2026-12-31T23:59:00Z'));
+      return sendWithOwner(400, await homePage(owner.ownerId, 'Expiration must be ISO 8601 with timezone. Example: 2026-12-31T23:59:00Z'), 'text/html; charset=utf-8');
     }
 
     const record = await store.create({
+      ownerId: owner.ownerId,
       originalUrl,
       customCode: customCode || null,
       title,
       expiresAt
     });
 
-    return send(res, 201, createdPage(buildShortUrl(req, record.shortCode), record));
+    return sendWithOwner(201, createdPage(buildShortUrl(req, record.shortCode), record), 'text/html; charset=utf-8');
   }
 
   if (req.method === 'POST' && pathName === '/api/shorten') {
     if (!requireApiKey(req)) {
-      return jsonError(res, 401, 'unauthorized', 'Missing or invalid API key.');
+      return jsonErrorWithOwner(401, 'unauthorized', 'Missing or invalid API key.');
     }
 
     const body = await parseBody(req);
@@ -314,20 +359,21 @@ async function route(req, res) {
     const expiresAtInput = String(body.expiresAt || '').trim();
 
     if (!isSafePublicHttpUrl(originalUrl)) {
-      return jsonError(res, 400, 'invalid_url', 'Invalid URL. Must be public http(s).');
+      return jsonErrorWithOwner(400, 'invalid_url', 'Invalid URL. Must be public http(s).');
     }
 
     if (customCode && !isValidCustomCode(customCode)) {
-      return jsonError(res, 400, 'invalid_custom_code', 'Invalid custom code.');
+      return jsonErrorWithOwner(400, 'invalid_custom_code', 'Invalid custom code.');
     }
 
     const expiresAt = toIsoOrNull(expiresAtInput);
     if (expiresAtInput && !expiresAt) {
-      return jsonError(res, 400, 'invalid_expiration', 'Invalid expiration datetime. Use ISO 8601 with timezone.');
+      return jsonErrorWithOwner(400, 'invalid_expiration', 'Invalid expiration datetime. Use ISO 8601 with timezone.');
     }
 
-    const record = await store.create({ originalUrl, customCode: customCode || null, title, expiresAt });
-    return sendJson(res, 201, {
+    const record = await store.create({ ownerId: owner.ownerId, originalUrl, customCode: customCode || null, title, expiresAt });
+    return sendJsonWithOwner(201, {
+      ownerId: record.ownerId,
       shortCode: record.shortCode,
       shortUrl: buildShortUrl(req, record.shortCode),
       originalUrl: record.originalUrl,
@@ -340,13 +386,13 @@ async function route(req, res) {
   if (req.method === 'GET' && pathName.startsWith('/api/stats/')) {
     const code = decodeURIComponent(pathName.replace('/api/stats/', ''));
     const record = await store.getByCode(code);
-    if (!record) return jsonError(res, 404, 'not_found', 'Not found');
+    if (!record || record.ownerId !== owner.ownerId) return jsonErrorWithOwner(404, 'not_found', 'Not found');
 
     const limit = Math.max(1, Math.min(100, Number(reqUrl.searchParams.get('limit') || 25)));
     const offset = Math.max(0, Number(reqUrl.searchParams.get('offset') || 0));
     const totalVisits = record.visits.length;
 
-    return sendJson(res, 200, {
+    return sendJsonWithOwner(200, {
       shortCode: record.shortCode,
       originalUrl: record.originalUrl,
       title: record.title,
@@ -365,29 +411,28 @@ async function route(req, res) {
   if (req.method === 'GET' && pathName.startsWith('/stats/')) {
     const code = decodeURIComponent(pathName.replace('/stats/', ''));
     const record = await store.getByCode(code);
-    if (!record) return send(res, 404, notFoundPage());
-    return send(res, 200, statsPage(record));
+    if (!record || record.ownerId !== owner.ownerId) return sendWithOwner(404, notFoundPage(), 'text/html; charset=utf-8');
+    return sendWithOwner(200, statsPage(record), 'text/html; charset=utf-8');
   }
 
   if (req.method === 'GET' && pathName.length > 1) {
     const code = decodeURIComponent(pathName.slice(1));
     const record = await store.getByCode(code);
-    if (!record) return send(res, 404, notFoundPage());
+    if (!record) return sendWithOwner(404, notFoundPage(), 'text/html; charset=utf-8');
     if (isExpired(record.expiresAt)) {
-      return send(res, 410, await homePage('This short link has expired.'));
+      return sendWithOwner(410, await homePage(owner.ownerId, 'This short link has expired.'), 'text/html; charset=utf-8');
     }
 
-    const ipAddress = getClientIp(req);
     const userAgent = req.headers['user-agent'] || '';
     const referer = req.headers.referer || '';
 
-    await store.addVisit(code, { ipAddress, userAgent, referer });
-    res.writeHead(302, { location: record.originalUrl, ...getSecurityHeaders('text/plain; charset=utf-8') });
+    await store.addVisit(code, { userAgent, referer });
+    res.writeHead(302, { location: record.originalUrl, ...getSecurityHeaders('text/plain; charset=utf-8', baseHeaders) });
     res.end();
     return;
   }
 
-  return send(res, 404, notFoundPage());
+  return sendWithOwner(404, notFoundPage(), 'text/html; charset=utf-8');
 }
 
 const server = http.createServer((req, res) => {

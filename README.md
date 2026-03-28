@@ -6,11 +6,12 @@ A full-featured JavaScript link shortener website with:
 - Optional custom aliases
 - Optional expiration timestamps
 - Redirect + click tracking
-- Visit logs (IP, referer, user-agent)
+- Visit logs (referer, user-agent) with click counts (no IP storage)
 - Browser UI and JSON API
 - MongoDB Atlas persistence (works well on Render)
 - Automatic local-file fallback if `MONGODB_URI` is not set
 - Basic write rate limiting + optional API key auth
+- Owner-scoped link visibility (only your own links/stats are listed)
 
 ## Quick start (local)
 
@@ -107,6 +108,8 @@ Body:
 
 `GET /api/stats/<code>?limit=25&offset=0`
 
+This endpoint only returns stats when the requester owner ID matches the link owner. For API clients, pass `x-owner-id` consistently when creating and reading links.
+
 ### Redirect
 
 `GET /<code>`
@@ -121,6 +124,8 @@ Body:
 - `MONGODB_COLLECTION` (default: `links`)
 - `FALLBACK_FILE_PATH` (default: `./data/links.local.json`)
 - `API_KEY` (optional key required for `POST /api/shorten`)
+- `x-owner-id` request header (API clients: set this on create/stats to scope links to your identity)
+- Browser UI uses a secure cookie (`ll_owner`) to scope "Your recent links" and stats pages
 - `WRITE_RATE_LIMIT_WINDOW_MS` (default: `60000`)
 - `WRITE_RATE_LIMIT_MAX` (default: `30`)
 - `CLEANUP_INTERVAL_MS` (default: `900000`)
