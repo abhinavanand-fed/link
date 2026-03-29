@@ -307,15 +307,6 @@ async function route(req, res) {
     }
   }
 
-  if (req.method === 'POST' && (pathName === '/shorten' || pathName === '/api/shorten')) {
-    const rate = enforceWriteRateLimit(req);
-    if (rate.blocked) {
-      res.setHeader('retry-after', String(rate.retryAfterSeconds));
-      if (pathName === '/api/shorten') return jsonError(res, 429, 'rate_limited', 'Too many create requests. Please retry later.');
-      return send(res, 429, await homePage('Too many requests. Please wait and try again.'));
-    }
-  }
-
   if (req.method === 'POST' && pathName === '/shorten') {
     const body = await parseBody(req);
     const originalUrl = String(body.originalUrl || '').trim();

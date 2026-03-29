@@ -38,7 +38,8 @@ test('api/shorten requires API key when configured', async () => {
 });
 
 test('api/shorten creates link and stats supports pagination for same owner only', async () => {
-  const ownerId = 'owner-a';
+  const ownerId = `owner-a-${Date.now()}`;
+  const customCode = `docs${Math.random().toString(36).slice(2, 8)}`;
   const createResponse = await fetch(`${baseUrl}/api/shorten`, {
     method: 'POST',
     headers: {
@@ -48,7 +49,7 @@ test('api/shorten creates link and stats supports pagination for same owner only
     },
     body: JSON.stringify({
       url: 'https://example.com/docs',
-      customCode: 'docs12',
+      customCode,
       title: 'Docs',
       expiresAt: '2099-01-01T00:00:00Z'
     })
@@ -56,19 +57,19 @@ test('api/shorten creates link and stats supports pagination for same owner only
 
   assert.equal(createResponse.status, 201);
   const created = await createResponse.json();
-  assert.equal(created.shortCode, 'docs12');
+  assert.equal(created.shortCode, customCode);
   assert.equal(created.ownerId, ownerId);
 
-  const redirectResponse = await fetch(`${baseUrl}/docs12`, { redirect: 'manual' });
+  const redirectResponse = await fetch(`${baseUrl}/${customCode}`, { redirect: 'manual' });
   assert.equal(redirectResponse.status, 302);
 
-  const statsResponse = await fetch(`${baseUrl}/api/stats/docs12?limit=1&offset=0`, {
+  const statsResponse = await fetch(`${baseUrl}/api/stats/${customCode}?limit=1&offset=0`, {
     headers: { 'x-owner-id': ownerId }
   });
   assert.equal(statsResponse.status, 200);
 
   const stats = await statsResponse.json();
-  assert.equal(stats.shortCode, 'docs12');
+  assert.equal(stats.shortCode, customCode);
   assert.equal(stats.pagination.limit, 1);
   assert.equal(stats.pagination.offset, 0);
   assert.ok(Array.isArray(stats.visits));
@@ -76,7 +77,7 @@ test('api/shorten creates link and stats supports pagination for same owner only
     assert.equal('ipAddress' in stats.visits[0], false);
   }
 
-  const unauthorizedStats = await fetch(`${baseUrl}/api/stats/docs12`, {
+  const unauthorizedStats = await fetch(`${baseUrl}/api/stats/${customCode}`, {
     headers: { 'x-owner-id': 'owner-b' }
   });
   assert.equal(unauthorizedStats.status, 404);

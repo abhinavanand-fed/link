@@ -114,6 +114,22 @@ This endpoint only returns stats when the requester owner ID matches the link ow
 
 `GET /<code>`
 
+
+## Ownership scoping
+
+- API clients should send the same `x-owner-id` value on create/stats requests to see only their own links.
+- Browser UI uses a secure cookie (`ll_owner`) to scope **Your recent links** and stats pages.
+
+## Troubleshooting deploy syntax errors
+
+Before deploying, run:
+
+```bash
+npm run check:syntax
+```
+
+This catches parser/syntax issues in `server.js` and `lib/store.js` early.
+
 ## Environment variables
 
 - `PORT` (default: `5000`)
@@ -124,8 +140,6 @@ This endpoint only returns stats when the requester owner ID matches the link ow
 - `MONGODB_COLLECTION` (default: `links`)
 - `FALLBACK_FILE_PATH` (default: `./data/links.local.json`)
 - `API_KEY` (optional key required for `POST /api/shorten`)
-- `x-owner-id` request header (API clients: set this on create/stats to scope links to your identity)
-- Browser UI uses a secure cookie (`ll_owner`) to scope "Your recent links" and stats pages
 - `WRITE_RATE_LIMIT_WINDOW_MS` (default: `60000`)
 - `WRITE_RATE_LIMIT_MAX` (default: `30`)
 - `CLEANUP_INTERVAL_MS` (default: `900000`)
