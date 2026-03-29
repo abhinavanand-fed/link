@@ -60,8 +60,14 @@ test('api/shorten creates link and stats supports pagination for same owner only
   assert.equal(created.shortCode, customCode);
   assert.equal(created.ownerId, ownerId);
 
-  const redirectResponse = await fetch(`${baseUrl}/${customCode}`, { redirect: 'manual' });
+  const redirectResponse = await fetch(`${baseUrl}/${customCode}`, {
+    redirect: 'manual',
+    headers: { 'x-owner-id': ownerId }
+  });
   assert.equal(redirectResponse.status, 302);
+
+  const unauthorizedRedirect = await fetch(`${baseUrl}/${customCode}`, { redirect: 'manual' });
+  assert.equal(unauthorizedRedirect.status, 404);
 
   const statsResponse = await fetch(`${baseUrl}/api/stats/${customCode}?limit=1&offset=0`, {
     headers: { 'x-owner-id': ownerId }
