@@ -410,6 +410,9 @@ async function route(req, res) {
     const code = decodeURIComponent(pathName.slice(1));
     const record = await store.getByCode(code);
     if (!record) return sendWithOwner(404, notFoundPage(), 'text/html; charset=utf-8');
+    if (record.ownerId !== owner.ownerId) {
+      return sendWithOwner(404, notFoundPage(), 'text/html; charset=utf-8');
+    }
     if (isExpired(record.expiresAt)) {
       return sendWithOwner(410, await homePage(owner.ownerId, 'This short link has expired.'), 'text/html; charset=utf-8');
     }

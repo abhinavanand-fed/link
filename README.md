@@ -114,6 +114,8 @@ This endpoint only returns stats when the requester owner ID matches the link ow
 
 `GET /<code>`
 
+Redirects are private to the link owner. Requests from a different owner ID/cookie receive `404`.
+
 
 ## Ownership scoping
 
